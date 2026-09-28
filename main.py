@@ -73,7 +73,8 @@ WHAT YOU KNOW ABOUT THE STORE:
 
 RULES:
 - Use search_products to find products. Never guess products, prices, or stock.
-- HHS book bundles depend on class and stream (Matric, O Level, AKU EB, Fast Track). If the parent has not said both, ask before searching.
+- HHS book bundles depend on class and stream (Matric, O Level, AKU EB, Fast Track). "AKU", "AKU-EB" and "AKUEB" all mean the AKU EB stream, so never ask which stream when a parent says one of them. If the class or the stream is missing, ask only for what is missing before searching.
+- Groups: AKU EB has Biology or Computer. Matric has Biology, Computer, Commerce or Arts. When the parent wants AKU EB or Matric and the search results show separate bundles for each group, ask which group they want. If the results show only one bundle, do not ask about groups.
 - Bundles are for a specific session (for example 2026-27). Offer the newest session shown in the results and mention the session name.
 - Add to the cart only when the parent clearly wants that item. Use the exact handle and variant_id from the search results.
 - Quote prices only from tool results, in Rs. Shipping and taxes are calculated at checkout; do not state delivery charges or delivery times, point to the shipping policy page instead.
@@ -308,7 +309,27 @@ def cart_summary(cart: dict) -> dict:
     }
 
 
+ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V",
+         6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X"}
+
+
+def normalize_query(query: str) -> str:
+    """Spell things the way product titles do, so search finds them."""
+    # aku / akueb / aku-eb  ->  AKU EB
+    q = re.sub(r"\baku[\s\-]?eb\b|\baku\b", "AKU EB", query, flags=re.I)
+    # olevel / o-level  ->  O Level
+    q = re.sub(r"\bo[\s\-]?level\b", "O Level", q, flags=re.I)
+
+    # "class 5" -> "class 5 Class V" (titles use Roman numerals)
+    def add_roman(m):
+        n = int(m.group(2))
+        return f"{m.group(0)} Class {ROMAN[n]}" if n in ROMAN else m.group(0)
+
+    return re.sub(r"\b(class|grade)\s*(\d{1,2})\b", add_roman, q, flags=re.I)
+
+
 def tool_search_products(query: str) -> str:
+    query = normalize_query(query)
     result = get_qdrant().query_points(
         collection_name=PRODUCT_COLLECTION,
         query=models.Document(text=query, model=INFERENCE_MODEL),
