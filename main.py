@@ -486,7 +486,7 @@ def run_agent(session: dict, user_text: str) -> str:
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             tools=TOOLS,
-            temperature=0,
+            temperature=0.5,
         )
         msg = completion.choices[0].message
 
