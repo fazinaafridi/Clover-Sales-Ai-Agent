@@ -1,5 +1,6 @@
 """
 Clover.pk order assistant.
+Version: hybrid catalog search / stationery stream-safe update.
 
 Chats with parents, asks what they need, finds products, builds a cart,
 suggests "bought together" and best-selling add-ons, and hands over a
@@ -40,7 +41,10 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 PRODUCT_COLLECTION = os.getenv("PRODUCT_COLLECTION", "clover_products")
 
 SYNC_SECRET = os.getenv("SYNC_SECRET")
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.25"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.18"))
+EXACT_SEARCH_LIMIT = int(os.getenv("EXACT_SEARCH_LIMIT", "30"))
+VECTOR_SEARCH_LIMIT = int(os.getenv("VECTOR_SEARCH_LIMIT", "20"))
+MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "8"))
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -60,12 +64,55 @@ MAX_TOOL_ROUNDS = 6
 BESTSELLER_POOL = 60      # how many top sellers to keep ranked in Qdrant
 MAX_SUGGESTIONS = 4       # add-ons shown before checkout
 
+# Catalog rules: these are application rules, not LLM guesses.
+STREAMS_BY_CLASS = {
+    "pre-nursery": [],
+    "nursery": [],
+    "prep": ["matric", "o level", "fast track"],
+    "i": ["matric", "o level", "fast track"],
+    "ii": ["matric", "o level", "fast track"],
+    "iii": ["matric", "o level", "fast track"],
+    "iv": ["matric", "o level", "fast track"],
+    "v": ["matric", "o level", "fast track"],
+    "vi": ["matric", "o level", "fast track"],
+    "vii": ["matric", "o level", "fast track"],
+    "viii": ["matric", "o level", "fast track"],
+    "ix": ["matric", "o level", "aku eb", "fast track"],
+    "x": ["matric", "o level", "aku eb", "fast track"],
+}
+
+STREAM_ALIASES = {
+    "matric": "matric",
+    "o level": "o level",
+    "olevel": "o level",
+    "o-level": "o level",
+    "fast track": "fast track",
+    "fast-track": "fast track",
+    "aku": "aku eb",
+    "aku eb": "aku eb",
+    "aku-eb": "aku eb",
+    "akueb": "aku eb",
+}
+
+STATIONERY_TERMS = {
+    "stationery", "stationary", "notebook", "notebooks", "copy", "copies",
+    "register", "registers", "pencil", "pencils", "pen", "pens", "eraser",
+    "erasers", "sharpener", "sharpeners", "ruler", "rulers", "marker",
+    "markers", "highlighter", "highlighters", "file", "files", "folder",
+    "folders", "diary", "diaries", "lunch box", "water bottle", "bag",
+    "bags", "art material", "art materials", "glue", "scissors", "colour",
+    "colors", "crayons", "paper", "pages", "single line", "double line",
+    "l.h.m", "lhm",
+}
+
 # Store facts the assistant may state. Edit freely.
 STORE_INFO = f"""
 - Clover.pk sells school books, HHS book bundles, stationery, school essentials and toys.
 - Payment: only Cash on Delivery (COD) and PayFast (online). Never ask for payment details, and never tell anyone to pay into a bank account.
 - Support: Monday to Friday, 9:00 am to 5:00 pm. Phone +92-21-38722020, WhatsApp 0301 5676256.
 - Policy pages: shipping {STORE_URL}/pages/shipping-policy, exchange {STORE_URL}/pages/exchange-policy, refund {STORE_URL}/pages/refund-policy, cancellation {STORE_URL}/pages/cancellation-policy.
+- Catalog class/stream rules: Pre-Nursery and Nursery have Complete Bundle only; Prep-Class VIII offer Matric, O Level and Fast Track; Class IX-X offer Matric, O Level, AKU EB and Fast Track.
+- Stationery and school essentials do not require a stream. Never ask for a stream for stationery/essential items.
 """.strip()
 
 SYSTEM_PROMPT = f"""You are the friendly online order assistant for Clover.pk, a school books and stationery store.
@@ -75,9 +122,12 @@ WHAT YOU KNOW ABOUT THE STORE:
 {STORE_INFO}
 
 RULES:
-- You are also a helpful sales assistant. Start by finding out what the parent needs, one short question at a time (for books: class and stream; for stationery or essentials: what the child needs and roughly how many). Do not ask for things already given.
-- Use search_products to find products. Never guess products, prices, or stock.
-- HHS book bundles depend on class and stream (Matric, O Level, AKU EB, Fast Track). "AKU", "AKU-EB" and "AKUEB" all mean the AKU EB stream, so never ask which stream when a parent says one of them. If the class or the stream is missing, ask only for what is missing before searching.
+- You are also a helpful sales assistant. Start by finding out what the parent needs, one short question at a time. For book/bundle requests, class and stream may be required. For stationery or school essentials, NEVER ask for a stream; ask only for the item and quantity or other details needed to identify it. Do not ask for things already given.
+- Use search_products to find products. Never guess products, prices, stock, class, stream, or product availability.
+- Clover catalog rules are fixed: Pre-Nursery and Nursery have a Complete Bundle with no stream. Prep through Class VIII offer Matric, O Level and Fast Track. Class IX and X offer Matric, O Level, AKU EB and Fast Track.
+- These class/stream rules are catalog rules, not assumptions. If a parent asks for a valid combination such as Class III Matric, search for it. Never tell the parent that a class/stream combination is invalid unless product search confirms that no matching product exists.
+- "AKU", "AKU-EB" and "AKUEB" all mean the AKU EB stream, so never ask which stream when a parent says one of them.
+- Stationery and school essentials are not stream-dependent. Even if a parent mentions a class or stream while asking for stationery, do not ask for or require a stream to search.
 - Groups: AKU EB has Biology or Computer. Matric has Biology, Computer, Commerce or Arts. When the parent gives a class and stream and the results show separate bundles for several groups, list every matching bundle with its price and let the parent choose. Do not ask "which group?" before showing them.
 - Bundles are for a specific session (for example 2026-27). Offer the newest session shown in the results and mention the session name.
 - Add to the cart only when the parent clearly wants that item. Use the exact handle and variant_id from the search results.
@@ -252,10 +302,89 @@ def fetch_bestseller_ranks() -> dict:
         return {}
 
 
+def normalize_class_name(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = re.sub(r"\s+", " ", value)
+    value = value.replace("grade ", "class ")
+    value = re.sub(r"^class\s+", "", value)
+    roman_to_class = {
+        "pre nursery": "pre-nursery", "pre-nursery": "pre-nursery",
+        "nursery": "nursery", "prep": "prep",
+        "i": "i", "ii": "ii", "iii": "iii", "iv": "iv", "v": "v",
+        "vi": "vi", "vii": "vii", "viii": "viii", "ix": "ix", "x": "x",
+    }
+    return roman_to_class.get(value, value)
+
+
+def detect_product_class(title: str, text: str = "") -> str:
+    source = f"{title} {text}".lower()
+    if re.search(r"\bpre[- ]?nursery\b", source):
+        return "pre-nursery"
+    if re.search(r"\bnursery\b", source):
+        return "nursery"
+    if re.search(r"\bprep(?:aratory)?\b", source):
+        return "prep"
+    for n, roman in [(10, "x"), (9, "ix"), (8, "viii"), (7, "vii"), (6, "vi"),
+                     (5, "v"), (4, "iv"), (3, "iii"), (2, "ii"), (1, "i")]:
+        if re.search(rf"\bclass\s*{roman}\b", source, re.I):
+            return roman
+        if re.search(rf"\bclass\s*{n}\b", source, re.I):
+            return roman
+        if re.search(rf"\bgrade\s*{n}\b", source, re.I):
+            return roman
+    return ""
+
+
+def detect_stream(title: str, text: str = "") -> str:
+    source = f"{title} {text}".lower()
+    # More specific aliases first.
+    if re.search(r"\baku[\s-]?eb\b|\bakueb\b", source):
+        return "aku eb"
+    if re.search(r"\bo[\s-]?level\b", source):
+        return "o level"
+    if re.search(r"\bfast[\s-]?track\b", source):
+        return "fast track"
+    if re.search(r"\bmatric\b", source):
+        return "matric"
+    return ""
+
+
+def detect_session(text: str) -> str:
+    match = re.search(r"\b(20\d{2}\s*[-/]\s*\d{2,4})\b", text or "")
+    if not match:
+        return ""
+    return re.sub(r"\s*[-/]\s*", "-", match.group(1))
+
+
+def detect_product_category(title: str, product_type: str, tags: list, text: str = "") -> str:
+    # Prefer explicit product metadata/title over description prose. A book
+    # description can mention paper/notebooks and should not turn the product
+    # into a stationery item.
+    primary = " ".join([title or "", product_type or "", " ".join(tags or [])]).lower()
+    if any(term in primary for term in ("bundle", "complete bundle", "exercise bundle", "textbook bundle")):
+        return "bundle"
+    if any(term in primary for term in ("book", "textbook", "notes", "manual", "quran")):
+        return "book"
+    if any(term in primary for term in STATIONERY_TERMS):
+        return "stationery"
+    secondary = (text or "").lower()
+    if any(term in secondary for term in ("stationery", "notebook", "single line", "double line", "homework diary")):
+        return "stationery"
+    return "other"
+
+
 def build_point(product: dict, ranks: dict) -> models.PointStruct:
     tags = product.get("tags") or []
     if isinstance(tags, str):
-        tags = [t.strip() for t in tags.split(",")]
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    description = clean_text(product.get("body_html", ""), limit=5000)
+    title = product.get("title", "")
+    product_type = product.get("product_type", "")
+    catalog_class = detect_product_class(title, description)
+    catalog_stream = detect_stream(title, description)
+    catalog_session = detect_session(f"{title} {description}")
+    category = detect_product_category(title, product_type, tags, description)
 
     variants = [
         {
@@ -273,24 +402,36 @@ def build_point(product: dict, ranks: dict) -> models.PointStruct:
     if image:
         image += ("&" if "?" in image else "?") + "width=300"
 
+    # Keep the full useful product description in the vector text. The explicit
+    # metadata labels make class/stream/session relationships easier to retrieve.
     embed_text = (
-        f"{product.get('title', '')}. "
-        f"Type: {product.get('product_type', '')}. "
+        f"Product: {title}. "
+        f"Category: {category}. "
+        f"Class: {catalog_class or 'all/unspecified'}. "
+        f"Stream: {catalog_stream or 'none/not stream-specific'}. "
+        f"Session: {catalog_session or 'unspecified'}. "
+        f"Type: {product_type}. "
         f"Brand: {product.get('vendor', '')}. "
         f"Tags: {', '.join(tags)}. "
-        f"{clean_text(product.get('body_html', ''))}"
+        f"Description: {description}"
     )
 
     return models.PointStruct(
         id=product["id"],
         vector=models.Document(text=embed_text, model=INFERENCE_MODEL),
         payload={
-            "title": product.get("title", ""),
+            "title": title,
             "handle": product.get("handle", ""),
-            "product_type": product.get("product_type", ""),
+            "product_type": product_type,
+            "product_category": category,
+            "catalog_class": catalog_class,
+            "catalog_stream": catalog_stream,
+            "catalog_session": catalog_session,
             "bestseller_rank": ranks.get(product["id"], 9999),
             "image": image,
             "url": f"{STORE_URL}/products/{product.get('handle', '')}",
+            "description": description,
+            "tags": tags,
             "variants": variants,
         },
     )
@@ -301,6 +442,8 @@ def sync_products():
     SYNC_STATE.update(running=True, error=None)
     try:
         products = fetch_all_products()
+        if not products:
+            raise RuntimeError("Shopify returned no products; keeping the existing Qdrant collection.")
         ranks = fetch_bestseller_ranks()
         points = [build_point(p, ranks) for p in products]
 
@@ -319,6 +462,14 @@ def sync_products():
             field_name="bestseller_rank",
             field_schema=models.PayloadSchemaType.INTEGER,
         )
+        # Structured catalog fields let exact class/stream searches work even
+        # when semantic similarity is weak.
+        for field in ("catalog_class", "catalog_stream", "product_category", "catalog_session"):
+            client.create_payload_index(
+                collection_name=PRODUCT_COLLECTION,
+                field_name=field,
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
 
         for start in range(0, len(points), 50):
             client.upsert(
@@ -368,18 +519,66 @@ ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V",
 
 
 def normalize_query(query: str) -> str:
-    """Spell things the way product titles do, so search finds them."""
-    # aku / akueb / aku-eb  ->  AKU EB
-    q = re.sub(r"\baku[\s\-]?eb\b|\baku\b", "AKU EB", query, flags=re.I)
-    # olevel / o-level  ->  O Level
+    """Normalize common class/stream wording used by parents."""
+    q = re.sub(r"\baku[\s\-]?eb\b|\bakueb\b|\baku\b", "AKU EB", query, flags=re.I)
     q = re.sub(r"\bo[\s\-]?level\b", "O Level", q, flags=re.I)
+    q = re.sub(r"\bfast[\s\-]?track\b", "Fast Track", q, flags=re.I)
 
-    # "class 5" -> "class 5 Class V" (titles use Roman numerals)
     def add_roman(m):
         n = int(m.group(2))
         return f"{m.group(0)} Class {ROMAN[n]}" if n in ROMAN else m.group(0)
 
     return re.sub(r"\b(class|grade)\s*(\d{1,2})\b", add_roman, q, flags=re.I)
+
+
+def parse_search_intent(query: str) -> dict:
+    """Extract deterministic catalog filters from a natural-language query."""
+    q = normalize_query(query).lower()
+    intent = {"class": "", "stream": "", "session": "", "category": ""}
+
+    if re.search(r"\bpre[- ]?nursery\b", q):
+        intent["class"] = "pre-nursery"
+    elif re.search(r"\bnursery\b", q):
+        intent["class"] = "nursery"
+    elif re.search(r"\bprep(?:aratory)?\b", q):
+        intent["class"] = "prep"
+    else:
+        for n, roman in [(10, "x"), (9, "ix"), (8, "viii"), (7, "vii"), (6, "vi"),
+                         (5, "v"), (4, "iv"), (3, "iii"), (2, "ii"), (1, "i")]:
+            if re.search(rf"\bclass\s*{n}\b|\bgrade\s*{n}\b", q):
+                intent["class"] = roman
+                break
+            if re.search(rf"\bclass\s*{roman}\b", q):
+                intent["class"] = roman
+                break
+
+    if re.search(r"\baku[\s-]?eb\b|\bakueb\b", q):
+        intent["stream"] = "aku eb"
+    elif re.search(r"\bo[\s-]?level\b", q):
+        intent["stream"] = "o level"
+    elif re.search(r"\bfast[\s-]?track\b", q):
+        intent["stream"] = "fast track"
+    elif re.search(r"\bmatric\b", q):
+        intent["stream"] = "matric"
+
+    session = detect_session(q)
+    if session:
+        intent["session"] = session
+
+    if any(term in q for term in STATIONERY_TERMS):
+        intent["category"] = "stationery"
+    elif "bundle" in q:
+        intent["category"] = "bundle"
+    elif any(term in q for term in ("book", "books", "textbook", "textbooks", "notes", "manual", "quran")):
+        intent["category"] = "book"
+
+    # Stream is never a required filter for stationery. A parent may mention
+    # Matric/Class III while asking for a notebook, but the notebook remains a
+    # stationery search rather than a stream-specific book search.
+    if intent["category"] == "stationery":
+        intent["stream"] = ""
+
+    return intent
 
 
 def list_price(variant: dict):
@@ -390,37 +589,119 @@ def list_price(variant: dict):
 
 
 def tool_search_products(query: str, session: dict) -> str:
-    query = normalize_query(query)
-    result = get_qdrant().query_points(
-        collection_name=PRODUCT_COLLECTION,
-        query=models.Document(text=query, model=INFERENCE_MODEL),
-        limit=5,
-        with_payload=True,
-    )
-    found = []
-    for point in result.points:
-        if point.score < MIN_SCORE:
-            continue
-        p = point.payload
-        card = compact_product(p)
-        if card:
-            add_cards(session, [card])
-        found.append(
-            {
-                "title": p["title"],
-                "handle": p["handle"],
-                "url": p["url"],
-                "variants": [
-                    {
-                        "id": v["id"],
-                        "title": v["title"],
-                        "price": list_price(v),
-                        "available": v["available"],
-                    }
-                    for v in p["variants"][:8]
-                ],
-            }
+    """Hybrid catalog search: exact metadata filters first, vector search second."""
+    normalized = normalize_query(query)
+    intent = parse_search_intent(normalized)
+    client = get_qdrant()
+
+    must = []
+    if intent["class"]:
+        must.append(models.FieldCondition(
+            key="catalog_class", match=models.MatchValue(value=intent["class"])
+        ))
+    if intent["stream"]:
+        must.append(models.FieldCondition(
+            key="catalog_stream", match=models.MatchValue(value=intent["stream"])
+        ))
+    if intent["category"] in {"stationery", "bundle"}:
+        # Stationery and explicit bundle requests can be safely constrained.
+        # A generic "books" request must also be allowed to return bundles,
+        # because Clover book bundles are themselves the parent's book order.
+        must.append(models.FieldCondition(
+            key="product_category", match=models.MatchValue(value=intent["category"])
+        ))
+    if intent["session"]:
+        must.append(models.FieldCondition(
+            key="catalog_session", match=models.MatchValue(value=intent["session"])
+        ))
+
+    structured_filter = models.Filter(must=must) if must else None
+    candidates = []
+
+    # 1) Structured retrieval. This is what fixes cases such as
+    # "Class III Matric" where semantic similarity can be misleading.
+    if structured_filter:
+        try:
+            points, _ = client.scroll(
+                collection_name=PRODUCT_COLLECTION,
+                scroll_filter=structured_filter,
+                limit=EXACT_SEARCH_LIMIT,
+                with_payload=True,
+            )
+            candidates.extend(points)
+        except Exception:
+            logger.exception("Structured product search failed")
+
+    # 2) Vector retrieval. Use the structured filter when it found something;
+    # otherwise broaden the search so fuzzy product requests still work.
+    vector_filter = structured_filter if candidates else None
+    try:
+        result = client.query_points(
+            collection_name=PRODUCT_COLLECTION,
+            query=models.Document(text=normalized, model=INFERENCE_MODEL),
+            query_filter=vector_filter,
+            limit=VECTOR_SEARCH_LIMIT,
+            with_payload=True,
         )
+        candidates.extend(result.points)
+    except Exception:
+        logger.exception("Vector product search failed")
+
+    # De-duplicate by product id and rank exact metadata matches above semantic
+    # matches. For an explicit class+stream request, the exact catalog match wins.
+    seen = set()
+    ranked = []
+    for point in candidates:
+        if point.id in seen:
+            continue
+        seen.add(point.id)
+        payload = point.payload or {}
+        exact_fields = 0
+        if intent["class"] and payload.get("catalog_class") == intent["class"]:
+            exact_fields += 1
+        if intent["stream"] and payload.get("catalog_stream") == intent["stream"]:
+            exact_fields += 1
+        if intent["category"] and payload.get("product_category") == intent["category"]:
+            exact_fields += 1
+        if intent["session"] and payload.get("catalog_session") == intent["session"]:
+            exact_fields += 1
+        score = float(getattr(point, "score", 0.0) or 0.0)
+        ranked.append((exact_fields, score, point))
+
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    found = []
+    for exact_fields, score, point in ranked:
+        p = point.payload or {}
+        # Exact structured matches are trusted even when their vector score is
+        # below MIN_SCORE. Fuzzy-only results still need the normal threshold.
+        if exact_fields == 0 and score < MIN_SCORE:
+            continue
+        card = compact_product(p)
+        if not card:
+            continue
+        add_cards(session, [card])
+        found.append({
+            "title": p.get("title", ""),
+            "handle": p.get("handle", ""),
+            "url": p.get("url", ""),
+            "class": p.get("catalog_class", ""),
+            "stream": p.get("catalog_stream", ""),
+            "category": p.get("product_category", ""),
+            "session": p.get("catalog_session", ""),
+            "variants": [
+                {
+                    "id": v["id"],
+                    "title": v["title"],
+                    "price": list_price(v),
+                    "available": v["available"],
+                }
+                for v in p.get("variants", [])[:8]
+            ],
+        })
+        if len(found) >= MAX_SEARCH_RESULTS:
+            break
+
     if not found:
         return json.dumps({"message": "No matching products found."})
     return json.dumps(found)
