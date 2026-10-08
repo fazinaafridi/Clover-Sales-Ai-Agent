@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clover.pk order assistant</title>
+<style>
+  :root { --brand:#1f6f43; --ink:#1b1f1c; --line:#d9ded8; --soft:#f6f7f5; --accent:#f59e0b; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif; color:var(--ink); background:#fff; }
+  .chat { display:flex; flex-direction:column; height:100%; }
+  .head { background:var(--brand); color:#fff; padding:12px 14px; }
+  .title { font-size:17px; font-weight:600; line-height:1.2; }
+  .sub { font-size:13px; opacity:.9; margin-top:2px; }
+  .log { flex:1; overflow-y:auto; padding:12px; background:var(--soft); display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:88%; padding:9px 12px; border-radius:10px; font-size:15px; line-height:1.45; white-space:pre-wrap; word-wrap:break-word; }
+  .bot { background:#fff; border:1px solid var(--line); align-self:flex-start; }
+  .user { background:var(--brand); color:#fff; align-self:flex-end; }
+  .msg a { color:inherit; font-weight:600; text-decoration:underline; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { background:#fff; border:1px solid var(--brand); color:var(--brand); border-radius:16px; padding:6px 12px; font-size:14px; cursor:pointer; font-family:inherit; }
+
+  /* product cards */
+  .cards { display:flex; gap:10px; overflow-x:auto; padding:2px 2px 8px; scroll-snap-type:x mandatory; flex-shrink:0; }
+  .card { flex:0 0 172px; scroll-snap-align:start; background:#fff; border:1px solid var(--line); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }
+  .card img { width:100%; height:122px; object-fit:contain; background:#fafafa; display:block; }
+  .noimg { height:122px; background:#eef1ee; display:flex; align-items:center; justify-content:center; font-size:32px; }
+  .cbody { padding:8px; display:flex; flex-direction:column; gap:6px; flex:1; }
+  .tag { font-size:11px; font-weight:600; color:#b45309; }
+  .ctitle { font-size:13px; font-weight:600; line-height:1.3; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+  .cprice { font-weight:700; color:var(--brand); }
+  .card select { width:100%; font-size:12px; padding:4px; border:1px solid #b8c0b7; border-radius:6px; font-family:inherit; }
+  .add { margin-top:auto; border:0; background:var(--brand); color:#fff; border-radius:8px; padding:8px; font-weight:600; cursor:pointer; font-family:inherit; }
+  .add:disabled { background:#9aa59a; cursor:default; }
+
+  /* cart bar */
+  .cartbar { border-top:1px solid var(--line); background:#fff; }
+  .cartsum { display:flex; justify-content:space-between; padding:9px 12px; font-weight:600; font-size:14px; cursor:pointer; }
+  .cartlist { display:none; max-height:140px; overflow-y:auto; padding:0 12px 6px; font-size:13px; }
+  .cartlist.open { display:block; }
+  .li { display:flex; justify-content:space-between; gap:8px; padding:5px 0; border-bottom:1px solid #f0f0f0; }
+  .li button { border:0; background:none; color:#c62828; cursor:pointer; font-size:14px; }
+  .checkout { display:block; margin:0 12px 8px; width:calc(100% - 24px); border:0; background:var(--accent); color:#fff; border-radius:8px; padding:10px; font-weight:700; font-size:15px; cursor:pointer; font-family:inherit; }
+  .checkout:disabled { background:#cfcfcf; cursor:default; }
+
+  .row { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); background:#fff; }
+  .input { flex:1; min-width:0; font-size:16px; font-family:inherit; padding:9px 10px; border:1px solid #b8c0b7; border-radius:8px; }
+  .send { background:var(--brand); color:#fff; border:0; border-radius:8px; padding:0 16px; font-size:15px; font-family:inherit; cursor:pointer; }
+  .send:disabled { opacity:.5; cursor:default; }
+  .chip:focus-visible,.send:focus-visible,.input:focus-visible,.add:focus-visible,.checkout:focus-visible { outline:3px solid #f2b705; outline-offset:2px; }
+</style>
+</head>
+<body>
+<div class="chat">
+  <div class="head">
+    <div class="title">Clover.pk</div>
+    <div class="sub">Books, bundles and stationery</div>
+  </div>
+  <div class="log" id="log" role="log" aria-live="polite"></div>
+
+  <div class="cartbar">
+    <div class="cartsum" id="cartsum"></div>
+    <div class="cartlist" id="cartlist"></div>
+    <button class="checkout" id="checkout" disabled>Checkout</button>
+  </div>
+
+  <div class="row">
+    <input class="input" id="input" type="text" maxlength="500" placeholder="Type your message" aria-label="Your message">
+    <button class="send" id="send">Send</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  // >>> Your Render address (no slash at the end) <<<
+  var API = "https://clover-sales-ai-agent.onrender.com";
+  var WHATSAPP = "0301 5676256";
+
+  var log = document.getElementById("log");
+  var input = document.getElementById("input");
+  var send = document.getElementById("send");
+  var cartSum = document.getElementById("cartsum");
+  var cartList = document.getElementById("cartlist");
+  var checkoutBtn = document.getElementById("checkout");
+  var sessionId = null;
+  var busy = false;
+  var cart = { items: [], subtotal: "Rs. 0" };
+
+  try { sessionId = localStorage.getItem("cloverbot_session"); } catch (e) {}
+
+  // Wake the server (free Render plans sleep).
+  fetch(API + "/").catch(function () {});
+
+  // ---------- helpers ----------
+  function h(tag, attrs, kids) {
+    var el = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) {
+      if (k === "text") el.textContent = attrs[k];
+      else if (k.slice(0, 2) === "on") el.addEventListener(k.slice(2), attrs[k]);
+      else el.setAttribute(k, attrs[k]);
+    });
+    (kids || []).forEach(function (c) { if (c) el.appendChild(c); });
+    return el;
+  }
+
+  function esc(s) {
+    return s.replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function linkify(s) {
+    return esc(s).replace(/https?:\/\/[^\s<]+[^\s<.,;:!?)]/g, function (url) {
+      var label = url.indexOf("/cart/") > -1 ? "Open my cart and checkout" : url;
+      return '<a href="' + url + '" target="_blank" rel="noopener">' + label + "</a>";
+    });
+  }
+
+  function ensureSession() {
+    if (!sessionId) {
+      sessionId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+        : "s" + Date.now() + Math.random().toString(16).slice(2);
+      try { localStorage.setItem("cloverbot_session", sessionId); } catch (e) {}
+    }
+    return sessionId;
+  }
+
+  function scrollDown() { log.scrollTop = log.scrollHeight; }
+
+  function addMsg(text, who) {
+    var m = document.createElement("div");
+    m.className = "msg " + (who === "user" ? "user" : "bot");
+    if (who === "user") m.textContent = text; else m.innerHTML = linkify(text);
+    log.appendChild(m);
+    scrollDown();
+    return m;
+  }
+
+  // POST with 60s timeout and one retry (covers Render cold starts).
+  function post(path, body, retry) {
+    var ctrl = new AbortController();
+    var t = setTimeout(function () { ctrl.abort(); }, 60000);
+    return fetch(API + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal
+    }).then(function (r) {
+      clearTimeout(t);
+      if (!r.ok) { var e = new Error("status " + r.status); e.status = r.status; throw e; }
+      return r.json();
+    }).catch(function (err) {
+      clearTimeout(t);
+      var transient = !err.status || err.status >= 502;
+      if (retry !== false && transient) {
+        return new Promise(function (res) { setTimeout(res, 4000); })
+          .then(function () { return post(path, body, false); });
+      }
+      throw err;
+    });
+  }
+
+  // ---------- cart ----------
+  function updateCart(c) {
+    if (c) cart = c;
+    var n = 0;
+    (cart.items || []).forEach(function (i) { n += i.qty; });
+    cartSum.textContent = "";
+    cartSum.appendChild(h("span", { text: "\uD83D\uDED2 Cart (" + n + ")" }));
+    cartSum.appendChild(h("span", { text: cart.subtotal || "Rs. 0" }));
+    cartList.textContent = "";
+    (cart.items || []).forEach(function (i) {
+      cartList.appendChild(h("div", { "class": "li" }, [
+        h("span", { text: i.qty + " \u00d7 " + i.name }),
+        h("span", {}, [
+          document.createTextNode(i.line_total + " "),
+          h("button", { text: "\u2715", title: "Remove", "aria-label": "Remove item", onclick: function () {
+            post("/cart/remove", { session_id: ensureSession(), variant_id: i.variant_id })
+              .then(function (r) { updateCart(r.cart); }).catch(function () {});
+          } })
+        ])
+      ]));
+    });
+    checkoutBtn.disabled = n === 0;
+  }
+  cartSum.onclick = function () { cartList.classList.toggle("open"); };
+
+  checkoutBtn.onclick = function () {
+    if (!sessionId || !cart.items.length) return;
+    checkoutBtn.disabled = true;
+    post("/cart/checkout", { session_id: sessionId })
+      .then(function (r) {
+        if (r.url) {
+          addMsg("Your cart is ready. You can choose Cash on Delivery or PayFast on the next page.\n" + r.url, "bot");
+          window.open(r.url, "_blank", "noopener");
+        } else if (r.products && r.products.length) {
+          addMsg("Before checkout, parents often pick these too \uD83D\uDC47", "bot");
+          renderCards(r.products);
+          addMsg("Add any you like, then tap Checkout again.", "bot");
+        } else if (r.error) {
+          addMsg(r.error, "bot");
+        }
+      })
+      .catch(function () { addMsg("Sorry, something went wrong. Please try again.", "bot"); })
+      .then(function () { checkoutBtn.disabled = !cart.items.length; });
+  };
+
+  // ---------- product cards ----------
+  function renderCards(products) {
+    if (!products || !products.length) return;
+    var row = h("div", { "class": "cards" });
+    products.forEach(function (p) { row.appendChild(card(p)); });
+    log.appendChild(row);
+    scrollDown();
+  }
+
+  function card(p) {
+    var variants = p.variants || [];
+    if (!variants.length) return h("div");
+    var sel = null;
+    var priceEl = h("div", { "class": "cprice", text: variants[0].price || "" });
+    var body = [];
+    if (p.label) body.push(h("div", { "class": "tag", text: "\u2B50 " + p.label }));
+    body.push(h("div", { "class": "ctitle", text: p.title }));
+    if (variants.length > 1) {
+      sel = h("select", { "aria-label": "Choose option" });
+      variants.forEach(function (v) {
+        sel.appendChild(h("option", { value: v.id, text: v.title + " \u2014 " + (v.price || "") }));
+      });
+      sel.addEventListener("change", function () {
+        var v = variants.filter(function (x) { return x.id === sel.value; })[0];
+        priceEl.textContent = v ? (v.price || "") : "";
+      });
+      body.push(sel);
+    }
+    body.push(priceEl);
+
+    var btn = h("button", { "class": "add", text: "Add to cart" });
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      btn.textContent = "Adding\u2026";
+      post("/cart/add", {
+        session_id: ensureSession(), handle: p.handle,
+        variant_id: sel ? sel.value : variants[0].id, quantity: 1
+      }).then(function (r) {
+        updateCart(r.cart);
+        btn.textContent = r.ok ? "Added \u2713" : (r.error || "Unavailable");
+        setTimeout(function () { btn.disabled = false; btn.textContent = r.ok ? "Add more" : "Add to cart"; }, r.ok ? 1500 : 2500);
+      }).catch(function () { btn.disabled = false; btn.textContent = "Try again"; });
+    });
+    body.push(btn);
+
+    var top = p.image
+      ? h("a", { href: p.url, target: "_blank", rel: "noopener" }, [h("img", { src: p.image, alt: p.title, loading: "lazy" })])
+      : h("div", { "class": "noimg", text: "\uD83D\uDCDA" });
+    return h("div", { "class": "card" }, [top, h("div", { "class": "cbody" }, body)]);
+  }
+
+  // ---------- chat ----------
+  function ask(text) {
+    text = text.trim();
+    if (!text || busy) return;
+    busy = true;
+    send.disabled = true;
+    input.value = "";
+    var chips = log.querySelector(".chips");
+    if (chips) chips.remove();
+    addMsg(text, "user");
+    var wait = addMsg("Typing\u2026", "bot");
+
+    post("/chat", { message: text, session_id: ensureSession() })
+      .then(function (data) {
+        sessionId = data.session_id || sessionId;
+        try { localStorage.setItem("cloverbot_session", sessionId); } catch (e) {}
+        wait.innerHTML = linkify(data.reply || "Sorry, I didn't get that.");
+        renderCards(data.products);
+        updateCart(data.cart);
+      })
+      .catch(function () {
+        wait.textContent = "Sorry, I can't reach the assistant right now. Please WhatsApp us on " + WHATSAPP + ".";
+      })
+      .then(function () {
+        busy = false;
+        send.disabled = false;
+        scrollDown();
+        input.focus();
+      });
+  }
+
+  addMsg("Hi! I can help you find books and stationery and prepare your order. What are you looking for?", "bot");
+  var chips = document.createElement("div");
+  chips.className = "chips";
+  ["Book bundle for my child's class", "Stationery", "Payment and delivery"].forEach(function (t) {
+    var c = document.createElement("button");
+    c.className = "chip";
+    c.textContent = t;
+    c.onclick = function () { ask(t); };
+    chips.appendChild(c);
+  });
+  log.appendChild(chips);
+
+  updateCart();
+  // Restore the cart if this browser already has a session on the server.
+  if (sessionId) {
+    post("/cart/remove", { session_id: sessionId, variant_id: "0" }, false)
+      .then(function (r) { updateCart(r.cart); }).catch(function () {});
+  }
+
+  send.onclick = function () { ask(input.value); };
+  input.addEventListener("keydown", function (e) { if (e.key === "Enter") ask(input.value); });
+})();
+</script>
+</body>
+</html>

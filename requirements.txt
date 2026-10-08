@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+requests
+qdrant-client>=1.14
+groq
