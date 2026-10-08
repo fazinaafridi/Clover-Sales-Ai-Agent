@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import re
+import time
+from difflib import SequenceMatcher
 import uuid
 from typing import Optional
 
@@ -107,7 +109,7 @@ STATIONERY_TERMS = {
 
 # Store facts the assistant may state. Edit freely.
 STORE_INFO = f"""
-- Clover.pk sells school books, HHS book bundles, stationery, school essentials and toys.
+- Clover.pk sells HHS book bundles, textbooks, workbooks, exercise books/notebooks, stationery, school supplies/essential kits, lunch boxes and water bottles, HHS souvenirs, toys/fun items, and other catalog products.
 - Payment: only Cash on Delivery (COD) and PayFast (online). Never ask for payment details, and never tell anyone to pay into a bank account.
 - Support: Monday to Friday, 9:00 am to 5:00 pm. Phone +92-21-38722020, WhatsApp 0301 5676256.
 - Policy pages: shipping {STORE_URL}/pages/shipping-policy, exchange {STORE_URL}/pages/exchange-policy, refund {STORE_URL}/pages/refund-policy, cancellation {STORE_URL}/pages/cancellation-policy.
@@ -123,11 +125,12 @@ WHAT YOU KNOW ABOUT THE STORE:
 
 RULES:
 - You are also a helpful sales assistant. Start by finding out what the parent needs, one short question at a time. For book/bundle requests, class and stream may be required. For stationery or school essentials, NEVER ask for a stream; ask only for the item and quantity or other details needed to identify it. Do not ask for things already given.
-- Use search_products to find products. Never guess products, prices, stock, class, stream, or product availability.
+- Use search_products to find products. Never guess products, prices, stock, class, stream, category, or product availability. Search the catalog before saying something is unavailable.
 - Clover catalog rules are fixed: Pre-Nursery and Nursery have a Complete Bundle with no stream. Prep through Class VIII offer Matric, O Level and Fast Track. Class IX and X offer Matric, O Level, AKU EB and Fast Track.
 - These class/stream rules are catalog rules, not assumptions. If a parent asks for a valid combination such as Class III Matric, search for it. Never tell the parent that a class/stream combination is invalid unless product search confirms that no matching product exists.
 - "AKU", "AKU-EB" and "AKUEB" all mean the AKU EB stream, so never ask which stream when a parent says one of them.
-- Stationery and school essentials are not stream-dependent. Even if a parent mentions a class or stream while asking for stationery, do not ask for or require a stream to search.
+- Stationery, exercise books/notebooks, school supplies, essential kits, lunch boxes, water bottles, souvenirs and toys are not stream-dependent. Even if a parent mentions a class or stream while asking for one of these items, do not ask for or require a stream to search.
+- Product names are important: if a parent asks for a generic item such as "single line copy", search product titles for all matching variants (LHM/RHM, page counts, interleaf, etc.) instead of relying only on semantic similarity.
 - Groups: AKU EB has Biology or Computer. Matric has Biology, Computer, Commerce or Arts. When the parent gives a class and stream and the results show separate bundles for several groups, list every matching bundle with its price and let the parent choose. Do not ask "which group?" before showing them.
 - Bundles are for a specific session (for example 2026-27). Offer the newest session shown in the results and mention the session name.
 - Add to the cart only when the parent clearly wants that item. Use the exact handle and variant_id from the search results.
@@ -260,6 +263,8 @@ def get_groq() -> Groq:
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (CloverOrderBot)"}
 SYNC_STATE = {"running": False, "products": 0, "error": None}
+CATALOG_CACHE = {"at": 0.0, "products": []}
+CATALOG_CACHE_TTL = 300
 
 
 def clean_text(html: str, limit: int = 300) -> str:
@@ -268,7 +273,7 @@ def clean_text(html: str, limit: int = 300) -> str:
 
 
 def fetch_all_products() -> list:
-    """Read the public product list, 250 at a time, until it runs out."""
+    """Read the public Shopify catalog, 250 products at a time."""
     products, page = [], 1
     while True:
         r = requests.get(
@@ -282,7 +287,21 @@ def fetch_all_products() -> list:
         if not batch:
             return products
         products.extend(batch)
+        if len(batch) < 250:
+            return products
         page += 1
+
+
+def get_live_catalog_cached() -> list:
+    """Return a short-lived live Shopify catalog for reliable title searches."""
+    now = time.time()
+    if CATALOG_CACHE["products"] and now - CATALOG_CACHE["at"] < CATALOG_CACHE_TTL:
+        return CATALOG_CACHE["products"]
+    products = fetch_all_products()
+    if products:
+        CATALOG_CACHE["products"] = products
+        CATALOG_CACHE["at"] = now
+    return products
 
 
 def fetch_bestseller_ranks() -> dict:
@@ -444,6 +463,8 @@ def sync_products():
         products = fetch_all_products()
         if not products:
             raise RuntimeError("Shopify returned no products; keeping the existing Qdrant collection.")
+        CATALOG_CACHE["products"] = products
+        CATALOG_CACHE["at"] = time.time()
         ranks = fetch_bestseller_ranks()
         points = [build_point(p, ranks) for p in products]
 
@@ -588,12 +609,171 @@ def list_price(variant: dict):
         return None
 
 
+def normalize_product_name(value: str) -> str:
+    """Normalize product names for lexical matching across Clover naming variants."""
+    value = (value or "").lower()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[\/_|+–—-]+", " ", value)
+    value = re.sub(r"[^a-z0-9.\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    aliases = {
+        "stationary": "stationery",
+        "copies": "copy",
+        "notebooks": "notebook",
+        "registers": "register",
+        "pencils": "pencil",
+        "pens": "pen",
+        "erasers": "eraser",
+        "markers": "marker",
+        "highlighters": "highlighter",
+        "sharpeners": "sharpener",
+    }
+    return " ".join(aliases.get(token, token) for token in value.split())
+
+
+def product_payload_from_shopify(product: dict) -> dict:
+    """Create the same card/search payload shape used by Qdrant."""
+    tags = product.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    title = product.get("title", "")
+    description = clean_text(product.get("body_html", ""), limit=5000)
+    product_type = product.get("product_type", "")
+    category = detect_product_category(title, product_type, tags, description)
+    image = (product.get("image") or {}).get("src") or next(
+        (i.get("src") for i in product.get("images", [])), ""
+    )
+    if image:
+        image += ("&" if "?" in image else "?") + "width=300"
+    return {
+        "title": title,
+        "handle": product.get("handle", ""),
+        "product_type": product_type,
+        "product_category": category,
+        "catalog_class": detect_product_class(title, description),
+        "catalog_stream": detect_stream(title, description),
+        "catalog_session": detect_session(f"{title} {description}"),
+        "bestseller_rank": 9999,
+        "image": image,
+        "url": f"{STORE_URL}/products/{product.get('handle', '')}",
+        "description": description,
+        "tags": tags,
+        "variants": [
+            {
+                "id": str(v["id"]),
+                "title": v.get("title", ""),
+                "price": v.get("price"),
+                "available": v.get("available", True),
+            }
+            for v in product.get("variants", [])[:20]
+        ],
+    }
+
+
+def lexical_product_score(query: str, payload: dict) -> float:
+    """Score product-name matches; exact wording beats semantic similarity."""
+    q = normalize_product_name(query)
+    title = normalize_product_name(payload.get("title", ""))
+    tags = normalize_product_name(" ".join(payload.get("tags", []) or []))
+    if not q or not title:
+        return 0.0
+
+    q_tokens = set(q.split())
+    title_tokens = set(title.split())
+    overlap = len(q_tokens & title_tokens) / max(1, len(q_tokens))
+    phrase = 1.0 if q in title else 0.0
+    token_phrase = 1.0 if all(token in title_tokens for token in q_tokens) else 0.0
+    sequence = SequenceMatcher(None, q, title).ratio()
+    tag_overlap = len(q_tokens & set(tags.split())) / max(1, len(q_tokens)) if tags else 0.0
+
+    # Product title is authoritative. This intentionally gives more weight to
+    # exact phrases/tokens than to descriptions, so "single line copy" finds
+    # every Single Line LHM/RHM/page-count variant.
+    return (phrase * 0.45) + (token_phrase * 0.30) + (overlap * 0.18) + (sequence * 0.05) + (tag_overlap * 0.02)
+
+
+def live_lexical_search(query: str, intent: dict, limit: int = MAX_SEARCH_RESULTS) -> list:
+    """Search the current Shopify catalog by product title before declaring no result."""
+    try:
+        products = get_live_catalog_cached()
+    except Exception:
+        logger.exception("Live catalog fallback failed")
+        return []
+
+    scored = []
+    for product in products:
+        payload = product_payload_from_shopify(product)
+
+        # Apply deterministic filters only when the customer actually asked for them.
+        if intent["class"] and payload.get("catalog_class") != intent["class"]:
+            continue
+        if intent["stream"] and payload.get("catalog_stream") != intent["stream"]:
+            continue
+        if intent["category"] in {"stationery", "bundle"} and payload.get("product_category") != intent["category"]:
+            continue
+        if intent["session"] and payload.get("catalog_session") != intent["session"]:
+            continue
+
+        score = lexical_product_score(query, payload)
+        if score >= 0.24:
+            scored.append((score, payload))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [payload for _, payload in scored[:limit]]
+
+
 def tool_search_products(query: str, session: dict) -> str:
-    """Hybrid catalog search: exact metadata filters first, vector search second."""
+    """Catalog-first search: live title match, structured Qdrant, then semantic fallback."""
     normalized = normalize_query(query)
     intent = parse_search_intent(normalized)
-    client = get_qdrant()
 
+    found = []
+    seen_handles = set()
+
+    def emit_payload(payload: dict):
+        handle = payload.get("handle", "")
+        if not handle or handle in seen_handles:
+            return False
+        card = compact_product(payload)
+        if not card:
+            return False
+        add_cards(session, [card])
+        seen_handles.add(handle)
+        found.append({
+            "title": payload.get("title", ""),
+            "handle": handle,
+            "url": payload.get("url", ""),
+            "class": payload.get("catalog_class", ""),
+            "stream": payload.get("catalog_stream", ""),
+            "category": payload.get("product_category", ""),
+            "session": payload.get("catalog_session", ""),
+            "variants": [
+                {
+                    "id": v["id"],
+                    "title": v["title"],
+                    "price": list_price(v),
+                    "available": v["available"],
+                }
+                for v in payload.get("variants", [])[:8]
+            ],
+        })
+        return True
+
+    # 1) Live Shopify title/metadata search. This is deliberately first so a
+    # newly-added product or a product missing from Qdrant is still discoverable.
+    # It also handles product-name families such as Single Line LHM/RHM copies.
+    try:
+        live_results = live_lexical_search(normalized, intent, limit=MAX_SEARCH_RESULTS)
+        for payload in live_results:
+            emit_payload(payload)
+            if len(found) >= MAX_SEARCH_RESULTS:
+                return json.dumps(found)
+    except Exception:
+        logger.exception("Live lexical product search failed")
+
+    # 2) Qdrant structured + semantic search for natural-language requests and
+    # products whose title alone is not enough to identify the intended item.
+    client = get_qdrant()
     must = []
     if intent["class"]:
         must.append(models.FieldCondition(
@@ -604,9 +784,6 @@ def tool_search_products(query: str, session: dict) -> str:
             key="catalog_stream", match=models.MatchValue(value=intent["stream"])
         ))
     if intent["category"] in {"stationery", "bundle"}:
-        # Stationery and explicit bundle requests can be safely constrained.
-        # A generic "books" request must also be allowed to return bundles,
-        # because Clover book bundles are themselves the parent's book order.
         must.append(models.FieldCondition(
             key="product_category", match=models.MatchValue(value=intent["category"])
         ))
@@ -618,8 +795,6 @@ def tool_search_products(query: str, session: dict) -> str:
     structured_filter = models.Filter(must=must) if must else None
     candidates = []
 
-    # 1) Structured retrieval. This is what fixes cases such as
-    # "Class III Matric" where semantic similarity can be misleading.
     if structured_filter:
         try:
             points, _ = client.scroll(
@@ -632,8 +807,6 @@ def tool_search_products(query: str, session: dict) -> str:
         except Exception:
             logger.exception("Structured product search failed")
 
-    # 2) Vector retrieval. Use the structured filter when it found something;
-    # otherwise broaden the search so fuzzy product requests still work.
     vector_filter = structured_filter if candidates else None
     try:
         result = client.query_points(
@@ -647,58 +820,33 @@ def tool_search_products(query: str, session: dict) -> str:
     except Exception:
         logger.exception("Vector product search failed")
 
-    # De-duplicate by product id and rank exact metadata matches above semantic
-    # matches. For an explicit class+stream request, the exact catalog match wins.
-    seen = set()
     ranked = []
     for point in candidates:
-        if point.id in seen:
-            continue
-        seen.add(point.id)
-        payload = point.payload or {}
-        exact_fields = 0
-        if intent["class"] and payload.get("catalog_class") == intent["class"]:
-            exact_fields += 1
-        if intent["stream"] and payload.get("catalog_stream") == intent["stream"]:
-            exact_fields += 1
-        if intent["category"] and payload.get("product_category") == intent["category"]:
-            exact_fields += 1
-        if intent["session"] and payload.get("catalog_session") == intent["session"]:
-            exact_fields += 1
-        score = float(getattr(point, "score", 0.0) or 0.0)
-        ranked.append((exact_fields, score, point))
-
-    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    found = []
-    for exact_fields, score, point in ranked:
         p = point.payload or {}
-        # Exact structured matches are trusted even when their vector score is
-        # below MIN_SCORE. Fuzzy-only results still need the normal threshold.
-        if exact_fields == 0 and score < MIN_SCORE:
+        handle = p.get("handle", "")
+        if not handle or handle in seen_handles:
             continue
-        card = compact_product(p)
-        if not card:
+        exact_fields = 0
+        if intent["class"] and p.get("catalog_class") == intent["class"]:
+            exact_fields += 1
+        if intent["stream"] and p.get("catalog_stream") == intent["stream"]:
+            exact_fields += 1
+        if intent["category"] and p.get("product_category") == intent["category"]:
+            exact_fields += 1
+        if intent["session"] and p.get("catalog_session") == intent["session"]:
+            exact_fields += 1
+        semantic_score = float(getattr(point, "score", 0.0) or 0.0)
+        title_score = lexical_product_score(normalized, p)
+        ranked.append((exact_fields, title_score, semantic_score, p))
+
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+
+    for exact_fields, title_score, semantic_score, payload in ranked:
+        # Structured matches are trusted. Otherwise require either a useful
+        # title match or the normal semantic threshold.
+        if exact_fields == 0 and title_score < 0.24 and semantic_score < MIN_SCORE:
             continue
-        add_cards(session, [card])
-        found.append({
-            "title": p.get("title", ""),
-            "handle": p.get("handle", ""),
-            "url": p.get("url", ""),
-            "class": p.get("catalog_class", ""),
-            "stream": p.get("catalog_stream", ""),
-            "category": p.get("product_category", ""),
-            "session": p.get("catalog_session", ""),
-            "variants": [
-                {
-                    "id": v["id"],
-                    "title": v["title"],
-                    "price": list_price(v),
-                    "available": v["available"],
-                }
-                for v in p.get("variants", [])[:8]
-            ],
-        })
+        emit_payload(payload)
         if len(found) >= MAX_SEARCH_RESULTS:
             break
 
