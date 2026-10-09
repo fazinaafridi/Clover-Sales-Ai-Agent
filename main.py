@@ -8,7 +8,7 @@ Shopify cart link. Payment (COD / PayFast) always happens on Shopify checkout.
 
 Flow:  widget.js  ->  POST /chat  ->  Groq (with tools)  ->  Qdrant / Shopify
 """
-
+import groq
 import json
 import logging
 import os
@@ -36,7 +36,7 @@ logger = logging.getLogger("clover-bot")
 STORE_URL = os.getenv("STORE_URL", "https://www.clover.pk").rstrip("/")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 QDRANT_URL = os.getenv("QDRANT_URL") or os.getenv("QDRANT_HOST")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -44,7 +44,7 @@ PRODUCT_COLLECTION = os.getenv("PRODUCT_COLLECTION", "clover_products")
 
 SYNC_SECRET = os.getenv("SYNC_SECRET")
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.18"))
-EXACT_SEARCH_LIMIT = int(os.getenv("EXACT_SEARCH_LIMIT", "30"))
+EXACT_SEARCH_LIMIT = int(os.getenv("EXACT_SEARCH_LIMIT", "8"))
 VECTOR_SEARCH_LIMIT = int(os.getenv("VECTOR_SEARCH_LIMIT", "20"))
 MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "8"))
 
@@ -778,7 +778,7 @@ def tool_search_products(query: str, session: dict) -> str:
                     "price": list_price(v),
                     "available": v["available"],
                 }
-                for v in payload.get("variants", [])[:8]
+                for v in payload.get("variants", [])[:3]
             ],
         })
         return True
@@ -1106,7 +1106,7 @@ def get_session(session_id: str) -> dict:
     return SESSIONS[session_id]
 
 
-def trim_history(messages: list, keep: int = 24) -> list:
+def trim_history(messages: list, keep: int = 12) -> list:
     """Keep recent messages, always starting at a user message."""
     messages = messages[-keep:]
     while messages and messages[0]["role"] != "user":
@@ -1126,6 +1126,8 @@ def run_agent(session: dict, user_text: str) -> str:
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             tools=TOOLS,
             temperature=0.5,
+            max_completion_tokens=1000,
+            reasoning_effort="low",
         )
         msg = completion.choices[0].message
 
@@ -1151,6 +1153,19 @@ def run_agent(session: dict, user_text: str) -> str:
                 ],
             }
         )
+
+            try:
+        reply = run_agent(session, text)
+    except groq.RateLimitError:
+        return {
+            "reply": "I'm getting a lot of questions right now 🙏 Please try again in a minute, or WhatsApp us on 0301 5676256.",
+            "session_id": session_id,
+            "products": [],
+            "cart": cart_summary(session["cart"]),
+        }
+    except Exception:
+        logger.exception("Chat failed")
+        raise HTTPException(503, "The assistant is unavailable right now.")
 
         for call in msg.tool_calls:
             try:
