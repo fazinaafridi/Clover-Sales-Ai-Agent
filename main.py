@@ -34,6 +34,12 @@ logger = logging.getLogger("clover-bot")
 # ============================================================================
 
 STORE_URL = os.getenv("STORE_URL", "https://www.clover.pk").rstrip("/")
+SUPPORT_WHATSAPP_URL = "https://wa.me/923015676256"
+SUPPORT_FALLBACK_MESSAGE = (
+    "Sorry, I can't reach the AI Assistant right now. "
+    "Please contact our Customer Support Person on WhatsApp."
+)
+SUPPORT_BUTTON_LABEL = "Contact Customer Support on WhatsApp"
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
@@ -115,7 +121,7 @@ STATIONERY_TERMS = {
     "folders", "diary", "diaries", "lunch box", "water bottle", "bag",
     "bags", "art material", "art materials", "glue", "scissors", "colour",
     "colors", "crayons", "paper", "pages", "single line", "double line",
-    "l.h.m", "lhm",
+    "l.h.m", "lhm","rhm",
 }
 
 # Store facts the assistant may state. Edit freely.
@@ -411,16 +417,31 @@ def detect_session(text: str) -> str:
 
 
 def detect_product_category(title: str, product_type: str, tags: list, text: str = "") -> str:
-    # Prefer explicit product metadata/title over description prose. A book
-    # description can mention paper/notebooks and should not turn the product
-    # into a stationery item.
-    primary = " ".join([title or "", product_type or "", " ".join(tags or [])]).lower()
+    """Classify products without mistaking exercise-book stationery for textbooks."""
+    title_text = (title or "").lower()
+    type_text = (product_type or "").lower()
+    tags_text = " ".join(tags or []).lower()
+    primary = " ".join([title_text, type_text, tags_text])
+
+    # Bundles must always win over other category clues.
     if any(term in primary for term in ("bundle", "complete bundle", "exercise bundle", "textbook bundle")):
         return "bundle"
-    if any(term in primary for term in ("book", "textbook", "notes", "manual", "quran")):
-        return "book"
-    if any(term in primary for term in STATIONERY_TERMS):
+
+    # A specific stationery title (e.g. "Single Line LHM 120 Pages") must
+    # override a generic Shopify product_type such as "Exercise Books".
+    # Otherwise the word "book" in product_type incorrectly classifies it as
+    # a book and the stationery search filter hides it from customers.
+    if any(term in title_text for term in STATIONERY_TERMS):
         return "stationery"
+    if any(term in tags_text for term in STATIONERY_TERMS):
+        return "stationery"
+
+    # Keep explicit academic books/notes/manuals as book products.
+    if any(term in " ".join([title_text, tags_text, type_text]) for term in ("textbook", "notes", "manual", "quran")):
+        return "book"
+    if "book" in title_text or "book" in tags_text or "book" in type_text:
+        return "book"
+
     secondary = (text or "").lower()
     if any(term in secondary for term in ("stationery", "notebook", "single line", "double line", "homework diary")):
         return "stationery"
@@ -1221,7 +1242,7 @@ def run_agent(session: dict, user_text: str) -> str:
                 {"role": "tool", "tool_call_id": call.id, "content": result}
             )
 
-    return "Sorry, I couldn't finish that. Please try again, or WhatsApp us on 0301 5676256."
+    return SUPPORT_FALLBACK_MESSAGE
 
 
 # ============================================================================
@@ -1267,14 +1288,32 @@ def chat(req: ChatRequest):
         reply = run_agent(session, text)
     except Exception:
         logger.exception("Chat failed")
-        raise HTTPException(503, "The assistant is unavailable right now.")
+        # Return a normal JSON response so the widget can show a WhatsApp button.
+        # The frontend should render the button when the "support" field is present.
+        return {
+            "reply": SUPPORT_FALLBACK_MESSAGE,
+            "session_id": session_id,
+            "products": [],
+            "cart": cart_summary(session["cart"]),
+            "support": {
+                "label": SUPPORT_BUTTON_LABEL,
+                "url": SUPPORT_WHATSAPP_URL,
+            },
+        }
 
-    return {
+    is_support_fallback = reply == SUPPORT_FALLBACK_MESSAGE
+    response = {
         "reply": reply,
         "session_id": session_id,
         "products": session.get("cards", []),
         "cart": cart_summary(session["cart"]),
     }
+    if is_support_fallback:
+        response["support"] = {
+            "label": SUPPORT_BUTTON_LABEL,
+            "url": SUPPORT_WHATSAPP_URL,
+        }
+    return response
 
 
 @app.post("/sync-products")
