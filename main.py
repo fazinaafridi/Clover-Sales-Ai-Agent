@@ -37,6 +37,17 @@ STORE_URL = os.getenv("STORE_URL", "https://www.clover.pk").rstrip("/")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+# Fallbacks are tried only when the selected model is rate-limited.
+# Set GROQ_FALLBACK_MODELS="" to disable them, or provide comma-separated model IDs.
+GROQ_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GROQ_FALLBACK_MODELS",
+        "qwen/qwen3.8-27b,openai/gpt-oss-120b",
+    ).split(",")
+    if model.strip()
+]
+GROQ_MAX_COMPLETION_TOKENS = int(os.getenv("GROQ_MAX_COMPLETION_TOKENS", "500"))
 
 QDRANT_URL = os.getenv("QDRANT_URL") or os.getenv("QDRANT_HOST")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -1106,26 +1117,74 @@ def get_session(session_id: str) -> dict:
     return SESSIONS[session_id]
 
 
-def trim_history(messages: list, keep: int = 24) -> list:
-    """Keep recent messages, always starting at a user message."""
-    messages = messages[-keep:]
-    while messages and messages[0]["role"] != "user":
-        messages.pop(0)
-    return messages
+def trim_history(messages: list, keep: int = 10) -> list:
+    """
+    Keep only recent user/final-assistant turns between requests.
+    Old tool-call transcripts and tool results are discarded because they can
+    consume thousands of tokens and are not needed to answer the next turn.
+    Tool calls/results generated during the current turn are still kept.
+    """
+    clean = []
+    for message in messages:
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        if message.get("tool_calls"):
+            continue
+        content = message.get("content")
+        if content is None:
+            continue
+        clean.append({"role": role, "content": content})
+
+    clean = clean[-keep:]
+    while clean and clean[0]["role"] != "user":
+        clean.pop(0)
+    return clean
+
+
+def create_chat_completion(messages: list):
+    """
+    Call the configured Groq model with fallback models on 429 rate limits.
+    A smaller output cap and compact history reduce TPM pressure.
+    """
+    model_order = []
+    for model in [GROQ_MODEL] + GROQ_FALLBACK_MODELS:
+        if model and model not in model_order:
+            model_order.append(model)
+
+    last_error = None
+    for model in model_order:
+        try:
+            return get_groq().chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                temperature=0.3,
+                max_completion_tokens=GROQ_MAX_COMPLETION_TOKENS,
+            )
+        except Exception as exc:
+            last_error = exc
+            status_code = getattr(exc, "status_code", None)
+            is_rate_limit = status_code == 429 or "rate_limit_exceeded" in str(exc).lower()
+            if not is_rate_limit:
+                raise
+            logger.warning("Groq model %s rate-limited; trying fallback if available.", model)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("No Groq chat model is configured.")
 
 
 def run_agent(session: dict, user_text: str) -> str:
     session["cards"] = []
+    # Compact previous-turn history before adding the new request.
+    session["messages"] = trim_history(session.get("messages", []))
     session["messages"].append({"role": "user", "content": user_text})
-    session["messages"] = trim_history(session["messages"])
     messages = session["messages"]
 
     for _ in range(MAX_TOOL_ROUNDS):
-        completion = get_groq().chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-            tools=TOOLS,
-            temperature=0.5,
+        completion = create_chat_completion(
+            [{"role": "system", "content": SYSTEM_PROMPT}] + messages
         )
         msg = completion.choices[0].message
 
